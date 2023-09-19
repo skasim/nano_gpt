@@ -3,16 +3,16 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 32 # how many independent sequences will we process in parallel?
-block_size = 8 # what is the maximum content length for our predictions?
+batch_size = 32  # how many independent sequences will we process in parallel?
+block_size = 8  # what is the maximum content length for our predictions?
 max_iters = 5000
 eval_interval = 300
 learning_rate = 1e-3
 device = "cuda" if torch.cuda.is_available() else "cpu"
 eval_iters = 200
 n_embed = 32 # number of embedding dimensions, i.e., the size of the learned embedding for each word
-n_head = 4
-n_layer = 4
+n_heads = 4
+n_layers = 4
 dropout = 0.2
 # ------------
 
@@ -42,7 +42,7 @@ val_data = data[n:]
 def get_batch(split):
     # generate a small batch of data of inputs x and targets y
     data = train_data if split == "train" else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,)) # random offsets in the dataset
+    ix = torch.randint(len(data) - block_size, (batch_size,))  # random offsets in the dataset
     x = torch.stack([data[i:i+block_size] for i in ix])
     y = torch.stack([data[i+1:i+block_size+1] for i in ix])
     x, y = x.to(device), y.to(device)
@@ -146,7 +146,7 @@ class BigramLanguageModel(nn.Module):
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
         self.blocks = nn.Sequential( # so that we are interspersing communication and computation
             *[Block(n_embed, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embed), # at the end fof the transformer and right before final linear layer you need a layer norm
+        self.ln_f = nn.LayerNorm(n_embed) # at the end fof the transformer and right before final linear layer you need a layer norm
         self.lm_head = nn.Linear(n_embed, vocab_size)
         # nn.Embedding is a simple lookup table that stores embeddings of a fixed dictionary and size
         # you store word embeddings with this module and retrieve them with indices
@@ -160,10 +160,13 @@ class BigramLanguageModel(nn.Module):
         # B=batch_size, T==block_size, C==vocab_size
         tok_emb = self.token_embedding_table(idx)  # (B, T, C). the embedding table maps an index value to a weight matrix of a certain dim
         # in the embedding table key is the ch index and value is the ch vector
+        print(f"SHAPE: {self.position_embedding_table}")
+
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         x = tok_emb + pos_emb # (B, T, C) x holds token identifies AND the positions at which tokens occur
         x = self.blocks(x) # (B, T, C)
         # go from token embeddings to logits
+        x = self.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
         # logits are vector of raw non-normalized predictions that a classification model generates
         # logits are basically the scores for the next character in the sequence
@@ -204,7 +207,7 @@ m = model.to(device)
 optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3) # 3e-4 is typically a good setting for a learning rate, but with smaller networks you can get away with higher
 
 for iter in range(max_iters):
-    # every once in a while evalute the loss on train and val sets
+    # every once in a while evaluate the loss on train and val sets
     if iter % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -219,6 +222,5 @@ for iter in range(max_iters):
 
 # generate from the model
 context = torch.zeros((1,1), dtype=torch.long, device=device)
-print(context)
 generated_idx = m.generate(idx=context, max_new_tokens=500)[0].tolist()
 print(decode(generated_idx))

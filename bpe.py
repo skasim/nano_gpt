@@ -71,7 +71,7 @@ class Encoder:
         self.encoder = encoder
         self.decoder = {v:k for k,v in self.encoder.items()}
         # bpe merge list that defines the bpe "tree", of tuples (a,b) that are to merge to token ab
-        self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges))))
+        self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges)))) # e.g. of bpe_ranks ('J', 'ust'): 5447, ('Ġtax', 'es'): 5448, ('8', '4'): 5449...49997, ('Ġinform', 'ants'): 49998, ('Ġg', 'azed'): 49999
         # the splitting pattern used for pre-tokenization
         # Should haved added re.IGNORECASE so BPE merges can happen for capitalized versions of contractions <-- original openai comment
         """
@@ -106,8 +106,8 @@ class Encoder:
         if token in self.cache:
             return self.cache[token]
 
-        word = tuple(token) # individual characters that make up the token, in a tuple
-        pairs = get_pairs(word) # get all bigrams
+        word = tuple(token) # token is a word, e.g., Hello. word (confusingly!) is individual characters that make up the token, in a tuple, e.g., ('H', 'e', 'l', 'l', 'o')
+        pairs = get_pairs(word) # get all bigrams, e.g., {('l', 'l'), ('e', 'l'), ('l', 'o'), ('H', 'e')}
 
         if not pairs:
             return token
@@ -116,9 +116,12 @@ class Encoder:
 
             # find the next lowest rank bigram that can be merged
             bigram = min(pairs, key = lambda pair: self.bpe_ranks.get(pair, float('inf')))
+            # above uses self.bpe_ranks.get(pair, float('inf')) to get the ranking for the pair of bytes (e.g., ('e', 'l') is 161
+            # it does this for every pair in pairs
+            # then it finds the pair with the lowest ranking
             if bigram not in self.bpe_ranks:
                 break # no more bigrams are eligible to be merged
-            first, second = bigram
+            first, second = bigram # e.g., bigram is ('e', 'll') then first=='e' and second=='ll'
 
             # we will now replace all occurrences of (first, second) in the list of current
             # words into one merged token first_second, in the output list new_words

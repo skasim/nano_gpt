@@ -80,9 +80,9 @@ class Head(nn.Module):
         q = self.query(x) # (B, T, C)
         # compute attention scores ("affinities)
         wei = q @ k.transpose(-2, -1) * C**-0.5 # (B, T, C) @ (B, C, T) -> (B, T, T) AND C**-0.5 is 1/sqrt(C)
-        # the way transpose works is that we are saying transpose the inner most (-1) with the one before (-2)
+        # the way transpose works is that we are saying transpose the innermost (-1) with the one before (-2)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf")) # (B, T, T)
-        wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = F.softmax(wei, dim=-1)  # (B, T, T)
         wei = self.dropout(wei) # dropout randomly prevents some of the nodes from communicating
         # perform the weighted aggregation of the values
         v = self.value(x) # (B, T, C)
@@ -145,7 +145,7 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
         self.blocks = nn.Sequential( # so that we are interspersing communication and computation
-            *[Block(n_embed, n_head=n_head) for _ in range(n_layer)])
+            *[Block(n_embed, n_head=n_heads) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(n_embed) # at the end fof the transformer and right before final linear layer you need a layer norm
         self.lm_head = nn.Linear(n_embed, vocab_size)
         # nn.Embedding is a simple lookup table that stores embeddings of a fixed dictionary and size
@@ -157,10 +157,9 @@ class BigramLanguageModel(nn.Module):
         # targets are yb
         B, T = idx.shape
         # idx and targets are both (B, T) tensors of integers
-        # B=batch_size, T==block_size, C==vocab_size
+
         tok_emb = self.token_embedding_table(idx)  # (B, T, C). the embedding table maps an index value to a weight matrix of a certain dim
         # in the embedding table key is the ch index and value is the ch vector
-        print(f"SHAPE: {self.position_embedding_table}")
 
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         x = tok_emb + pos_emb # (B, T, C) x holds token identifies AND the positions at which tokens occur

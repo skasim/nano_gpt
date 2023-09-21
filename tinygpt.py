@@ -1,29 +1,23 @@
+"""
+GPT Language Model using BPE and sinusoidal and cosinusoidal embeddings.
+Adapted from https://github.com/karpathy/minGPT/blob/master/mingpt/model.py
+Base is from https://proceedings.neurips.cc/paper_files/paper/2017/file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf
+With additional updates from https://github.com/openai/gpt-2
+"""
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
 
 from bpe import BPETokenizer
+from configs import TinyGPTConfig, OptimizerConfig
 
-# hyperparameters
-batch_size = 5  # how many independent sequences will we process in parallel?
-block_size = 8  # what is the maximum content length for our predictions?
-max_iters = 3000
-eval_interval = 300
-learning_rate = 1e-3
-device = "cuda" if torch.cuda.is_available() else "cpu"
-eval_iters = 200
-n_embed = 32 # number of embedding dimensions, i.e., the size of the learned embedding for each word
-n_heads = 4
-n_layers = 4
-dropout = 0.2
-vocab_size = 50257
-# ------------
-
+config = TinyGPTConfig()
 torch.manual_seed(1337)
 
 # Load data from file
-with open("data/input.txt", "r", encoding="utf-8") as f:
+with open(config.input_file, "r", encoding="utf-8") as f:
     text = f.read()
 # print(f"TEXT:\n{text}")
 
@@ -33,109 +27,63 @@ data = bpe_tokenizer(text)
 
 
 # Create train and test split
-train_split = int(0.9 * data.shape[1])
+train_split = int(config.train_test_split * data.shape[1])
 train_data = data[:,:train_split]
 test_data = data[:,train_split:]
 
 # B=batch_size, T==block_size, C==vocab_size
 
 # Data batching
-def process_batch_row(row):
-    return [data[0][i] for i in row]
 def get_batch(split):
     # generate small batch of data of inputs x and targets y
     # this batch is based on the batch_size (num rows)
     # the block size is the num_cols
     # x and y should be of size (B, T)
     data = train_data if split == "train" else test_data
-    idx = torch.randint(high=data.shape[1] - block_size, size=(batch_size,)) # random offsets in the dataset of size batch_size, so just a list of len(batch_size) of random offsets
-    x = torch.stack([data[:,i:i+block_size] for i in idx])
-    y = torch.stack([data[:,i+1:i+block_size+1] for i in idx])
-    x, y = x.to(device), y.to(device)
+    idx = torch.randint(high=data.shape[1] - config.block_size, size=(config.batch_size,)) # random offsets in the dataset of size batch_size, so just a list of len(batch_size) of random offsets
+    x = torch.stack([data[:,i:i+config.block_size] for i in idx])
+    y = torch.stack([data[:,i+1:i+config.block_size+1] for i in idx])
+    x, y = x.to(config.device), y.to(config.device)
     return x.squeeze(), y.squeeze()
 
 
-class Head(nn.Module):
-    """one head of self-attention"""
-    def __init__(self, head_size):
+class MultiheadAttentionLayer(nn.Module):
+    def __init__(self, dtype=torch.float32):
         super().__init__()
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
-        self.dropout = nn.Dropout(dropout)
+        assert config.n_embed % config.n_heads == 0
+        self.resid_drop = nn.Dropout(config.dropout)
+        self.c_proj = nn.Linear(config.n_embed, config.n_embed, device=config.device, dtype=dtype)
+        self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
+                             .view(1, 1, config.block_size, config.block_size))
+        self.attn = nn.MultiheadAttention(config.n_embed, config.n_heads, batch_first=True)
 
     def forward(self, x):
-        B, T, C = x.shape
-        k = self.key(x) # B, T, C
-        q = self.query(x) # B, T, C
-        # compute attention scores ("affinities)
-        wei = q @ k.transpose(-2, -1) * C**-0.5 # (B, T, C) @ (B, C, T) -> (B, T, T) AND C**-0.5 is 1/sqrt(C)
-        # the way transpose works is that we are saying transpose the innermost (-1) with the one before (-2)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf")) # (B, T, T)
-        wei = F.softmax(wei, dim=-1)  # (B, T, T)
-        wei = self.dropout(wei) # dropout randomly prevents some of the nodes from communicating
-        # perform the weighted aggregation of the values
-        v = self.value(x) # (B, T, C)
-        out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
-        return out
-
-
-class MultiHeadAttention(nn.Module):
-    """multiple heads of attention in parallel"""
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList(Head(head_size) for _ in range(num_heads))
-        # nn.ModuleList is like a python list, so this is creating num head modules
-        self.proj = nn.Linear(n_embed, n_embed)  # to make linear the inputs
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1) # concatenating outputs over channel dim
-        out = self.proj(out) # project is the linear outcome of the above concatenation
-        out = self.dropout(out)
-        return out
-
-
-class NewGELU(nn.Module):
-    """
-    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
-    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
-    """
-    def forward(self, x):
-        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
-
-
-class FeedForward(nn.Module):
-    """a simple linear layer followed by a non-linearity"""
-
-    def __init__(self, n_embed):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embed, 4 * n_embed),
-            NewGELU(),
-            nn.Linear(4 * n_embed, n_embed), # project layer going back into the residual pathway
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        return self.net(x)
+        _, seq_size, _ = x.size()
+        y = self.attn(query=x.clone(), key=x, value=x, attn_mask=self.mask[0, 0, :seq_size, :seq_size])[0] # had to use an x.clone() because of an error in pytorch 2.0.1 with making this bool mask and resulting in NaNs
+        y = self.resid_drop(self.c_proj(y))
+        return y
 
 
 class Block(nn.Module):
     """Transformer block: communication followed by computation"""
     def __init__(self, n_embed, n_heads):
         super().__init__()
-        head_size = n_embed//n_heads
-        self.sa = MultiHeadAttention(n_heads, head_size)
-        self.ffwd = FeedForward(n_embed)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
+        self.attn = MultiheadAttentionLayer()
+        self.mlp = nn.Sequential(
+            nn.Linear(n_embed, 4 * n_embed),
+            nn.GELU(),
+            nn.Linear(4 * n_embed, n_embed),
+            nn.Dropout(config.dropout),
+        )
 
     def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
+        out = self.attn(self.ln1(x))
+        x = x + out # GPT-2 moved layer activation to the input of each sub-block
+        x = x + self.mlp(self.ln2(x))
         return x
+
 
 
 class PositionalEncoding(nn.Module):
@@ -155,56 +103,76 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class BigramLanguageModel(nn.Module):
+class EmbeddingStem(nn.Module):
     def __init__(self):
         super().__init__()
-        # each token directly reads off the logits for the next token from a lookup table
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
-        self.position_embedding_table = PositionalEncoding(d_model=n_embed)
-        # self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.blocks = nn.Sequential( # so that we are interspersing communication and computation
-            * [Block(n_embed, n_heads=n_heads) for _ in range(n_layers)])
-        self.ln_f = nn.LayerNorm(n_embed)  # at the end fof the transformer and right before final linear layer you need a layer norm
-        self.lm_head = nn.Linear(n_embed, vocab_size)
-        # nn.Embedding is a simple lookup table that stores embeddings of a fixed dictionary and size
-        # you store word embeddings with this module and retrieve them with indices
-        # input to the module is a list of indices and the output is corresponding word embeddings
+        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embed)
+        self.pos_emb = PositionalEncoding(d_model=config.n_embed)
+        self.drop = nn.Dropout(config.dropout)
+
+    def reset_parameters(self):
+        self.tok_emb.reset_parameters()
+
+    def forward(self, idx):
+        token_embeddings = self.tok_emb(idx)
+        position_embeddings = self.pos_emb(token_embeddings)
+        return self.drop(token_embeddings + position_embeddings)
+
+
+class TinyGPT(nn.Module):
+    """GPT Language Model"""
+    def __init__(self, config):
+        super().__init__()
+        self.block_size = config.block_size
+        # input embedding stem
+        self.emb_stem = EmbeddingStem()
+        # transformer
+        self.blocks = nn.Sequential(*[Block(config.n_embed, config.n_heads) for _ in range(config.n_layers)])
+        # decoder head
+        self.ln_f = nn.LayerNorm(config.n_embed) # according to GPT-2 paper add a layer norm after the final self-attention block
+        self.head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+
+        # init all weights and apply a special scaled init to the residual projections per the GPT-2 paper
+        self.apply(self._init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith("c_proj.weight"):
+                p.data.normal_(mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
+
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
 
     def forward(self, idx, targets=None):
-        # idx is the input encoded input text. it is xb
-        # targets are yb
-        B, T = idx.shape
-        # idx and targets are both (B, T) tensors of integers
-
-        tok_emb = self.token_embedding_table(idx)  # (B, T, C). the embedding table maps an index value to a weight matrix of a certain dim
-        # in the embedding table key is the ch index and value is the ch vector
-
-        # pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
-        # x = tok_emb + pos_emb # (B, T, C) x holds token identifies AND the positions at which tokens occur
-        x = self.position_embedding_table(tok_emb) # (B, T, C)
-        x = self.blocks(x) # (B, T, C)
-        # go from token embeddings to logits
+        x = self.emb_stem(idx)
+        x = self.blocks(x)
         x = self.ln_f(x)
-        logits = self.lm_head(x) # (B, T, vocab_size)
-        # logits are vector of raw non-normalized predictions that a classification model generates
-        # logits are basically the scores for the next character in the sequence
+        logits = self.head(x)
 
-        if targets is None:
-            loss = None
-        else:
+        # if we are given some desired targets also calculate the loss
+        loss = None
+        if targets is not None:
             B, T, C = logits.shape
             logits = logits.view(B * T, C)  # the non-normalized predictions
             targets = targets.view(B * T)  # actual values
             loss = F.cross_entropy(logits, targets)  # measures quality of logits wrt targets
-
+            # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
 
+
     # continues generation for all the batch dims along the time dims
-    def generate(self, idx, max_new_tokens):
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             # crop idx to the last block_size tokens
-            idx_cond = idx[:, -block_size:]
+            idx_cond = idx[:, -self.block_size:]
             # get the predictions
             logits, loss = self(idx_cond)  # goes to forward function
             # focus only on the last time step
@@ -219,46 +187,79 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
         return idx
 
-
-# average losses over multiple batches
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ["train", "test"]:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
-
-
-model = BigramLanguageModel()
-m = model.to(device)
-# create a PyTorch optimizer
-optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3) # 3e-4 is typically a good setting for a learning rate, but with smaller networks you can get away with higher
-
-for iter in range(max_iters):
-    # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0:
-        losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, test loss {losses['test']:.4f}")
-    # sample a batch of data
-    xb, yb = get_batch("train")
-
-    # evaluate loss
-    logits, loss = m(xb, yb)
-    optimizer.zero_grad(set_to_none=True) # zero out gradient from previous step
-    loss.backward() # getting gradients for all parameters (weights)
-    optimizer.step() # use gradients to update parameters
+        # # idx is (B, T) array of indices in the current context
+        # for _ in range(max_new_tokens):
+        #     # if the sequence context is growing too long crop it at the block_size
+        #     idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
+        #     # forward the model to get the logits for the index in the sequence
+        #     logits, _ = self(idx_cond)
+        #     # pluck the logits at the final step and scale by desired temperature
+        #     logits = logits[:,-1,:] / temperature
+        #     # optionally crop the logits to only the top k options
+        #     if top_k is not None:
+        #         v, _ = torch.topk(logits, top_k)
+        #         logits[logits < v[:, [-1]]] = -float("inf")
+        #     # apply softmax to convert logits to (normalized) probabilities
+        #     probs = F.softmax(logits, dim=-1)
+        #     # either sample from the distribution or take the most likely element
+        #     if do_sample:
+        #         idx_next = torch.mul(probs, num_samples=1)
+        #     else:
+        #         _, idx_next = torch.topk(probs, k=1, dim=-1)
+        #     # append sampled index to the running sequence and continue
+        #     idx = torch.cat((idx, idx_next), dim=1)
+        # return idx
 
 
-# generate from the model
-context = torch.zeros((1,1), dtype=torch.long, device=device)
-generated_idx = m.generate(idx=context, max_new_tokens=500)[0].tolist()
-print(f"genid:\n{generated_idx}")
-torch_gen = torch.tensor(generated_idx)
-print(bpe_tokenizer.decode(torch_gen))
+
+def create_optimizer(model: torch.nn.Module, opt_config: OptimizerConfig):
+    """
+    This long function is unfortunately doing something very simple and is being very defensive:
+    We are separating out all parameters of the model into two buckets: those that will experience
+    weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
+    We are then returning the PyTorch optimizer object.
+    """
+
+    # separate out all parameters to those that will and won't experience regularizing weight decay
+    decay = set()
+    no_decay = set()
+    whitelist_weight_modules = (torch.nn.Linear,)
+    blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+    for mn, m in model.named_modules():
+        for pn, p in m.named_parameters():
+            fpn = '%s.%s' % (mn, pn) if mn else pn  # full param name
+            # random note: because named_modules and named_parameters are recursive
+            # we will see the same tensors p many many times. but doing it this way
+            # allows us to know which parent module any tensor p belongs to...
+            if pn.endswith('bias'):
+                # all biases will not be decayed
+                no_decay.add(fpn)
+            elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                # weights of whitelist modules will be weight decayed
+                decay.add(fpn)
+            elif pn.endswith('in_proj_weight'):
+                # MHA projection layer
+                decay.add(fpn)
+            elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                # weights of blacklist modules will NOT be weight decayed
+                no_decay.add(fpn)
+            elif pn.endswith('pos_emb'):
+                # positional embedding shouldn't be decayed
+                no_decay.add(fpn)
+
+    # validate that we considered every parameter
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    inter_params = decay & no_decay
+    union_params = decay | no_decay
+    assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
+    assert len(
+        param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
+                                                % (str(param_dict.keys() - union_params),)
+
+    # create the pytorch optimizer object
+    optim_groups = [
+        {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": opt_config.weight_decay},
+        {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(optim_groups, lr=opt_config.learning_rate, betas=(0.9, 0.95))
+    return optimizer
